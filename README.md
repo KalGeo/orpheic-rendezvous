@@ -47,11 +47,11 @@ sudo ufw allow 8750:8751/tcp
 sudo ufw allow 8752/udp
 ```
 
-Point a DNS record (e.g. `rendezvous.example.com`) at the server — **a name, not an IP**, so
-its address can change without re-pointing a single device.
-
-Then in Orpheic: **Settings → Advanced → Rendezvous server**, and enter your `host:port`
-(e.g. `rendezvous.example.com:8750`). Your phone learns it the next time you connect at home.
+Then in Orpheic: **Settings → Advanced → Rendezvous server**, and enter the address. A plain
+`IP:port` is perfectly fine — e.g. `203.0.113.10:8750`. If you'd rather, point a DNS name at
+the server (e.g. `rendezvous.example.com:8750`) so its address can later change without
+re-pointing a single device — nicer, but entirely optional. Your phone learns it the next
+time you connect at home.
 
 ## Configuration (environment variables)
 

@@ -1,0 +1,29 @@
+# The Orpheic rendezvous, as a systemd service. Adjust the path to where you put
+# rendezvous.py, then:
+#   sudo cp orpheic-rendezvous.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now orpheic-rendezvous
+[Unit]
+Description=Orpheic rendezvous (find-your-desktop, introductions only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/orpheic-rendezvous/rendezvous.py
+Restart=always
+RestartSec=5
+User=www-data
+Group=www-data
+Environment=RV_CONTROL_PORT=8750
+Environment=RV_RELAY_PORT=8751
+Environment=RV_OBS_PORT=8752
+# The relay (a blind fallback that carries the Link's ciphertext when hole punching fails)
+# is ON by default. Uncomment to make this a PURE introducer that never carries anything:
+#Environment=RV_RELAY=off
+# It needs nothing of the system's: no privileges, no home, no writable filesystem.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

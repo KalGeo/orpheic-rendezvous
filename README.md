@@ -73,6 +73,13 @@ WebSocket registration, a line-preamble TCP relay (`RV1 dial|attach|query|punch`
 two-datagram UDP "what do I look like?" exchange. It is deliberately small — one file, one
 event loop, no database.
 
+## Security
+
+Found a vulnerability? Please email **hello@orpheic.com** — see [SECURITY.md](SECURITY.md).
+Don't open a public issue for a security problem. (The server holds no keys, no data, and no
+media, and the end-to-end crypto doesn't trust it — so the concern here is availability, not
+disclosure.)
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Run it, change it, redistribute it; it is yours.

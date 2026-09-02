@@ -37,6 +37,9 @@ and writes nothing to disk.
 ```sh
 sudo mkdir -p /opt/orpheic-rendezvous
 sudo cp rendezvous.py /opt/orpheic-rendezvous/
+# a dedicated unprivileged user for the service (the unit runs as `orpheic-rv`)
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin orpheic-rv
+sudo chown -R orpheic-rv:orpheic-rv /opt/orpheic-rendezvous
 sudo cp orpheic-rendezvous.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now orpheic-rendezvous

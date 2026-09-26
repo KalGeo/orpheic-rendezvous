@@ -65,6 +65,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import sys
@@ -178,7 +179,9 @@ relay_rate = RateLimit(int(os.environ.get("RV_RELAY_BURST", "30")), float(os.env
 # Obs answers per source, plus a global ceiling to bound spoofed-source reflection.
 obs_rate   = RateLimit(int(os.environ.get("RV_OBS_BURST", "20")),   float(os.environ.get("RV_OBS_RATE", "5")))
 obs_global = RateLimit(int(os.environ.get("RV_OBS_GLOBAL_BURST", "2000")), float(os.environ.get("RV_OBS_GLOBAL_RATE", "1000")))
-conns_per_ip: dict = {}   # ip -> live control WS count
+MAX_LIVE = int(os.environ.get("RV_MAX_LIVE", str(2 * MAX_DESKTOPS)))  # global accept ceiling (fd backstop)
+_live_conns = 0           # total control WS past accept — the /64-rotation + fd-exhaustion backstop
+conns_per_ip: dict = {}   # rate_key(ip) -> live control WS count
 dials_per_ip: dict = {}   # ip -> parked dial count
 
 
@@ -195,6 +198,31 @@ def norm_ip(ip: str) -> str:
 
 def ip_of(addr) -> str:
     return norm_ip(addr[0]) if addr else ""
+
+
+def rate_key(ip: str) -> str:
+    """Fairness key for the rate/conn limits. An IPv6 host owns a whole /64 by default, so keying
+    on the full address lets ONE attacker mint unlimited "distinct IPs" and slip every per-IP cap
+    (MAX_CONN_PER_IP, the token buckets). Collapse v6 to its /64 network; v4 keeps its full
+    address. NEVER used for the punch target or candidate strings — those need the exact peer
+    address (see norm_ip). Server-side audit, 4/9."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if a.version == 6:
+        return str(ipaddress.ip_network((ip, 64), strict=False).network_address)
+    return ip
+
+
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def scrub(s) -> str:
+    """Strip C0/C1/DEL control bytes from any attacker-supplied string before it reaches a log
+    line — a raw CR/LF/ANSI would forge journal entries or spoof an admin's terminal. Same class
+    as the desktop's log-scrub fix. Server-side audit, 4/9."""
+    return _CTRL.sub("", s) if isinstance(s, str) else str(s)
 
 
 # Set RV_LIMIT_LOCAL=1 to make loopback NON-exempt — the only way to exercise the caps from
@@ -284,20 +312,29 @@ circuits = 0
 
 async def control(ws):
     """Guard the connection with the per-IP caps, then serve it."""
+    global _live_conns
     ip = ip_of(ws.remote_address)
-    if not is_local(ip) and (not conn_rate.allow(ip)
-                             or conns_per_ip.get(ip, 0) >= MAX_CONN_PER_IP):
+    rk = rate_key(ip)   # v6 collapsed to /64 so a single host's address-churn can't slip the caps
+    # Global accept ceiling FIRST: the /64 fix bounds one source, this bounds the fleet so a
+    # botnet of many IPs (or a soft LimitNOFILE) can't fd-starve every other user's remote.
+    if not is_local(ip) and _live_conns >= MAX_LIVE:
         await ws.close()
         return
-    conns_per_ip[ip] = conns_per_ip.get(ip, 0) + 1
+    if not is_local(ip) and (not conn_rate.allow(rk)
+                             or conns_per_ip.get(rk, 0) >= MAX_CONN_PER_IP):
+        await ws.close()
+        return
+    conns_per_ip[rk] = conns_per_ip.get(rk, 0) + 1
+    _live_conns += 1
     try:
         await _control(ws, ip)
     finally:
-        left = conns_per_ip.get(ip, 0) - 1
+        _live_conns -= 1
+        left = conns_per_ip.get(rk, 0) - 1
         if left > 0:
-            conns_per_ip[ip] = left
+            conns_per_ip[rk] = left
         else:
-            conns_per_ip.pop(ip, None)
+            conns_per_ip.pop(rk, None)
 
 
 async def _control(ws, ip):
@@ -319,14 +356,14 @@ async def _control(ws, ip):
         # ΚΑΝΟΝΙΚΟ κλειδί: το raw base64 του πελάτη είναι εύπλαστο (padding/τελευταία bytes) — ένα
         # ζεύγος κλειδιών θα έπιανε πολλές θέσεις στο μητρώο. Κλειδί = re-encode των 32 bytes (Fable).
         pub_b64 = base64.b64encode(pub).decode()
-    except (asyncio.TimeoutError, BadSignatureError, ValueError, KeyError,
+    except (asyncio.TimeoutError, BadSignatureError, ValueError, TypeError, KeyError,
             json.JSONDecodeError, websockets.ConnectionClosed):
         await ws.close()
         return
 
     # Past the signature — a genuine registration attempt. Bound how fast one source may make
     # them, and cap the registry globally, so no flood of free keys can exhaust memory.
-    if not is_local(ip) and not reg_rate.allow(ip):
+    if not is_local(ip) and not reg_rate.allow(rate_key(ip)):
         await ws.close()
         return
     if pub_b64 not in desktops and len(desktops) >= MAX_DESKTOPS:
@@ -364,7 +401,14 @@ async def _control(ws, ip):
         # knocked on and found open. A mapping a router accepted and then drops would otherwise
         # cost every phone a timeout.
         async def confirm_public(ip, ports, key):
-            if is_local(ip):        # μη «χτυπάς» localhost υπηρεσίες του ίδιου του server (Fable)
+            # ΠΟΤΕ μη «χτυπάς» loopback/RFC1918: με RV_LIMIT_LOCAL=1 το is_local() είναι νεκρό εδώ
+            # (γι' αυτό ο άμεσος έλεγχος)· κόβει το να γίνει ο server σαρωτής εσωτερικών υπηρεσιών
+            # (server-side audit 4/9). Το residual (public-IP port-scan CGNAT-γειτόνων) το φράζει το reg_rate.
+            try:
+                _a = ipaddress.ip_address(ip)
+                if _a.is_loopback or _a.is_private or _a.is_link_local:
+                    return
+            except ValueError:
                 return
             for port in ports:
                 if not (isinstance(port, int) and 1024 <= port < 65536):   # καμία προνομιακή θύρα
@@ -399,6 +443,8 @@ async def _control(ws, ip):
                 upd = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(upd, dict):   # [] / 7 / "x": .get would raise, mirror register (audit 4/9)
+                continue
             if upd.get("t") != "udp":
                 continue
             addr = upd.get("addr", "")
@@ -407,7 +453,8 @@ async def _control(ws, ip):
             # its own family's mapping/pinhole — see the punch answer below.
             addr6 = upd.get("addr6", "")
             addr6 = addr6 if isinstance(addr6, str) and 0 < len(addr6) < 64 else None
-            lans = [l for l in upd.get("lan", [])[:8]
+            _lan = upd.get("lan", [])
+            lans = [l for l in (_lan[:8] if isinstance(_lan, list) else [])
                     if isinstance(l, str) and 0 < len(l) < 64]
             if isinstance(addr, str) and len(addr) < 64:
                 quic[pub_b64] = {"udp": addr or None, "udp6": addr6,
@@ -415,7 +462,7 @@ async def _control(ws, ip):
                 if pub_b64 in fresh:
                     fresh[pub_b64].set()   # a punch is waiting on exactly this
                 log.info("quic door v4=%s v6=%s for %s…",
-                         addr or "(none)", addr6 or "(none)", pub_b64[:12])
+                         scrub(addr) or "(none)", scrub(addr6) or "(none)", pub_b64[:12])
     finally:
         if desktops.get(pub_b64) is ws:
             del desktops[pub_b64]
@@ -447,7 +494,7 @@ async def relay(reader, writer):
     """One relay-port connection: a dialer opening a circuit, or a desktop attaching to one."""
     global circuits
     rip = ip_of(writer.get_extra_info("peername"))
-    if not is_local(rip) and not relay_rate.allow(rip):
+    if not is_local(rip) and not relay_rate.allow(rate_key(rip)):
         writer.close()
         return
     try:
@@ -494,12 +541,12 @@ async def relay(reader, writer):
         allowed = (peer_ip is not None and target_ip is not None and target_ip == peer_ip)
         refused = not allowed
         if refused:
-            log.info("punch refused: target %s is not the asker %s", target_ip, peer_ip)
+            log.info("punch refused: target %s is not the asker %s", scrub(target_ip), scrub(peer_ip))
             ws = None
         if ws is not None and 0 < len(parts[3]) < 64:
             try:
                 await ws.send(json.dumps({"t": "punch", "addr": parts[3]}))
-                log.info("punch %s… toward %s", parts[2][:12], parts[3])
+                log.info("punch %s… toward %s", scrub(parts[2][:12]), scrub(parts[3]))
                 info = quic.get(canon(parts[2]))
                 if info is None or time.monotonic() - info.get("ts", 0) > FRESH_S:
                     ev = fresh.setdefault(canon(parts[2]), asyncio.Event())
@@ -588,12 +635,12 @@ async def relay(reader, writer):
         # count, AND how many one source may hold at once — else a single IP loops dials,
         # exhausts fds and floods the desktop with `incoming` while `circuits` reads zero.
         if ws is None or circuits >= MAX_CIRCUITS or len(pending) >= MAX_CIRCUITS \
-                or (not is_local(rip) and dials_per_ip.get(rip, 0) >= MAX_DIALS_PER_IP):
+                or (not is_local(rip) and dials_per_ip.get(rate_key(rip), 0) >= MAX_DIALS_PER_IP):
             writer.close()         # not here — the phone falls back to telling its user
             return
         cid = secrets.token_urlsafe(9)
         pending[cid] = (reader, writer)
-        dials_per_ip[rip] = dials_per_ip.get(rip, 0) + 1
+        dials_per_ip[rate_key(rip)] = dials_per_ip.get(rate_key(rip), 0) + 1
         try:
             try:
                 await ws.send(json.dumps({"t": "incoming", "cid": cid}))
@@ -606,11 +653,11 @@ async def relay(reader, writer):
             if pending.pop(cid, None) is not None:
                 writer.close()         # nobody came
         finally:
-            left = dials_per_ip.get(rip, 0) - 1
+            left = dials_per_ip.get(rate_key(rip), 0) - 1
             if left > 0:
-                dials_per_ip[rip] = left
+                dials_per_ip[rate_key(rip)] = left
             else:
-                dials_per_ip.pop(rip, None)
+                dials_per_ip.pop(rate_key(rip), None)
         return
 
     if parts[1] == "attach":
@@ -648,7 +695,11 @@ class ObsEar(asyncio.DatagramProtocol):
         ip = norm_ip(addr[0])
         # A rate-limited ear answers nobody, silently. The per-source bucket stops one asker
         # flooding; the global one bounds total reflection when the source is spoofed.
-        if not is_local(ip) and (not obs_global.allow("*") or not obs_rate.allow(ip)):
+        # PER-SOURCE FIRST (measured 26/9 on a local copy): checked the other way round, every
+        # packet of ONE flooding source spent a global token before its own bucket refused it —
+        # 580k pkts/s from a single IP drained the shared bucket and honest desktops/phones got
+        # no answer at all. Now a single source only ever spends its own 5/s of the global pool.
+        if not is_local(ip) and (not obs_rate.allow(rate_key(ip)) or not obs_global.allow("*")):
             return
         host = f"[{ip}]" if ":" in ip else ip
         self.transport.sendto(f"ORPH1 obs={host}:{addr[1]}".encode(), addr)

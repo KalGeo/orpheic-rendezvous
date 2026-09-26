@@ -48,6 +48,24 @@ LockPersonality=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+# Resource ceilings — the ONE thing this design fears is exhaustion, and app-level caps don't
+# bound it at the cgroup (server-side audit 4/9, all three models). A connection/fd/memory flood
+# that slips the buckets must hit a wall here, not OOM/fd-starve the shared box.
+#  - LimitNOFILE: the fd-exhaustion backstop (the process ran at soft=1024 — below MAX_DESKTOPS).
+#  - TasksMax: one asyncio thread + the getaddrinfo thread-pool; 64 is ample, a fork-bomb is not.
+LimitNOFILE=65536
+MemoryHigh=192M
+MemoryMax=256M
+TasksMax=64
+# A little more confinement, all free for this workload.
+SystemCallArchitectures=native
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+PrivateDevices=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

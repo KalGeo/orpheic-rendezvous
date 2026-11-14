@@ -1,5 +1,7 @@
 # Orpheic Rendezvous
 
+This is the meeting point used by [Orpheic](https://orpheic.com/), a free music player for the music files you own.
+
 The introducer for [Orpheic Remote](https://orpheic.com) — it helps your phone and your
 desktop **find** each other through the modern internet's walls, and carries nothing of yours.
 

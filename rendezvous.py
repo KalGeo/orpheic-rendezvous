@@ -60,6 +60,7 @@ Deploy: /opt/orpheic-rendezvous/ + the systemd unit (server/DEPLOY.md).
 """
 
 import asyncio
+import binascii
 import base64
 import ipaddress
 import json
@@ -490,6 +491,85 @@ async def pipe(reader, writer):
             pass
 
 
+# ── findd (docs/design/findability.md §12–§13): the heartbeat catalog, a separate process on the same box.
+# Desktops beat to it over UDP from their QUIC socket, so it knows their CURRENT doors even when this
+# server's WebSocket line to them is dead (4/11: a Mac woke with a new IPv6, the line stayed "open" to an
+# address that no longer existed, and the phone outside was told nothing). We ask it over a local Unix
+# socket: "where <pub-hex>" → "at <ip:port> …" | "none", and "punch <pub-hex> <ip> <port>" → it sends the
+# desktop a MAC'd punch order (0x18) over UDP. Empty RV_FINDD_CTL = off (the old road alone).
+FINDD_CTL = os.environ.get("RV_FINDD_CTL", "/run/orpheic-findd/ctl.sock")
+FINDD_TIMEOUT_S = float(os.environ.get("RV_FINDD_TIMEOUT_S", "0.5"))
+
+
+async def findd_ask(line: str):
+    """One question to findd; its one-line answer, or None (off, absent, slow). Never raises."""
+    if not FINDD_CTL:
+        return None
+    # our reply address sits beside findd's socket (same directory, same user) — findd answers there.
+    # A random name per question: two questions in flight can never share a reply socket (F/S: with a
+    # counter modulo 1000 a phone could have been handed ANOTHER desktop's door).
+    me = os.path.join(os.path.dirname(FINDD_CTL), f"rv-{secrets.token_hex(8)}.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        try:
+            os.unlink(me)
+        except FileNotFoundError:
+            pass
+        s.bind(me)
+        s.setblocking(False)
+        loop = asyncio.get_running_loop()
+        s.sendto(line.encode(), FINDD_CTL)   # a local datagram: never blocks in practice
+        data = await asyncio.wait_for(loop.sock_recv(s, 512), FINDD_TIMEOUT_S)
+        return data.decode(errors="replace").strip()
+    except (OSError, asyncio.TimeoutError):
+        return None
+    finally:
+        s.close()
+        try:
+            os.unlink(me)
+        except OSError:
+            pass
+
+
+def pub_hex(pub_b64: str):
+    try:
+        raw = base64.b64decode(pub_b64, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    return raw.hex() if len(raw) == 32 else None
+
+
+async def findd_punch(pub_b64: str, target: str):
+    """Order the punch through findd and return the desktop's doors {"udp": v4, "udp6": v6} as
+    findd knows them (fresh: they come from the last authenticated heartbeat), or None."""
+    hx = pub_hex(pub_b64)
+    host = _host_of(target)
+    try:
+        port = int(target.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    if hx is None or host is None:
+        return None
+    sent, where = await asyncio.gather(findd_ask(f"punch {hx} {host} {port}"), findd_ask(f"where {hx}"))
+    if not where or not where.startswith("at "):
+        return None
+    # findd answered but sent NO punch (its rate limits, or no live family): a door with no hole punched toward it is
+    # not the fresh answer it claims to be — let the WebSocket road order the punch and wait for its mirror (review 6/11).
+    if sent is not None and sent.strip() == "sent 0":
+        log.info("findd: %s… sent no punch — the WebSocket road answers", scrub(pub_b64[:12]))
+        return None
+    doors = {"udp": None, "udp6": None}
+    for a in where[3:].split():
+        if a.startswith("[") and doors["udp6"] is None:
+            doors["udp6"] = a
+        elif not a.startswith("[") and doors["udp"] is None:
+            doors["udp"] = a
+    if doors["udp"] is None and doors["udp6"] is None:
+        return None   # nothing usable: let the WebSocket road wait for its mirror (S N7)
+    log.info("findd: %s… at %s (punch %s)", scrub(pub_b64[:12]), scrub(where[3:]), scrub(sent or "?"))
+    return doors
+
+
 async def relay(reader, writer):
     """One relay-port connection: a dialer opening a circuit, or a desktop attaching to one."""
     global circuits
@@ -543,12 +623,16 @@ async def relay(reader, writer):
         if refused:
             log.info("punch refused: target %s is not the asker %s", scrub(target_ip), scrub(peer_ip))
             ws = None
+        # findd first: it knows the desktop's doors from its last authenticated heartbeat, and its punch
+        # order reaches the desktop over UDP even when the WebSocket line below is dead. Fresh by
+        # construction, so when it answers we do not wait for the WebSocket road's mirror (PUNCH_WAIT_S).
+        fd = await findd_punch(parts[2], parts[3]) if allowed and 0 < len(parts[3]) < 64 else None
         if ws is not None and 0 < len(parts[3]) < 64:
             try:
                 await ws.send(json.dumps({"t": "punch", "addr": parts[3]}))
                 log.info("punch %s… toward %s", scrub(parts[2][:12]), scrub(parts[3]))
                 info = quic.get(canon(parts[2]))
-                if info is None or time.monotonic() - info.get("ts", 0) > FRESH_S:
+                if fd is None and (info is None or time.monotonic() - info.get("ts", 0) > FRESH_S):
                     ev = fresh.setdefault(canon(parts[2]), asyncio.Event())
                     ev.clear()
                     try:
@@ -558,6 +642,9 @@ async def relay(reader, writer):
                     info = quic.get(canon(parts[2]))
             except websockets.ConnectionClosed:
                 info = None
+        if fd is not None:
+            # findd's doors win (fresher); the WebSocket registry may still add the LAN list
+            info = dict(info or {}, **{k: v for k, v in fd.items() if v})
         # Hand back the desktop's door of the SAME family the phone is punching: a v6 dial
         # (target_ip has colons) needs the v6 door, a v4 dial the v4 one. One door, in "udp",
         # so the phone reads it exactly as before — it never sees the other family's port.

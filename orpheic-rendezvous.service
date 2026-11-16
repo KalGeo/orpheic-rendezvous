@@ -2,8 +2,8 @@
 # See the header of rendezvous.py for what it does and what it deliberately cannot know.
 [Unit]
 Description=Orpheic rendezvous (find-your-desktop — introductions only)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target orpheic-findd.service
+Wants=network-online.target orpheic-findd.service
 # Never park in "failed" from a start-storm: a co-tenant that squats 8750/8751/8752 must not be
 # able to make systemd give up (default: 5 starts / 10s). A bind-blocked service keeps retrying
 # (RestartSec) and screaming in the journal instead of dying silently.
@@ -37,8 +37,21 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# Extra confinement — it only needs two UDP/TCP socket families and no capabilities at all.
-RestrictAddressFamilies=AF_INET AF_INET6
+# Extra confinement — UDP/TCP, plus a local Unix socket to findd (findability.md §13), no capabilities.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# findd's control socket lives here; the rendezvous binds its reply sockets beside it. Declared in BOTH
+# units (and preserved), so it exists whichever starts first — a ReadWritePaths on a missing directory
+# would bind nothing and leave the rendezvous unable to ask findd until its next restart (F/S).
+RuntimeDirectory=orpheic-findd
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/orpheic-findd
+# findd's PRIVATE key is in /etc/orpheic-findd, readable by this same user. The rendezvous never needs it: if this
+# process (the largest surface: websockets + JSON) were taken over, the key would let the attacker pose as findd to
+# every desktop until the key is rotated (security audit 6/11).
+InaccessiblePaths=-/etc/orpheic-findd
+# reply sockets of a killed rendezvous (normally each one is removed after its answer)
+ExecStartPre=-/bin/sh -c 'rm -f /run/orpheic-findd/rv-*.sock'
 CapabilityBoundingSet=
 AmbientCapabilities=
 MemoryDenyWriteExecute=yes

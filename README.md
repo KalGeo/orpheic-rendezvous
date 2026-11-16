@@ -66,6 +66,7 @@ time you connect at home.
 | `RV_RELAY_PORT` | `8751` | blind relay (fallback) |
 | `RV_OBS_PORT` | `8752` | UDP address ear (for hole punching) |
 | `RV_RELAY` | `on` | `off` makes this a pure introducer — it never carries a byte |
+| `RV_FINDD_CTL` | `/run/orpheic-findd/ctl.sock` | where to ask findd (see below); if nothing answers there, it carries on without it |
 
 Every door is rate-limited per source IP with global ceilings and idle eviction, all tunable
 via `RV_*` variables (see the top of `rendezvous.py`). The defaults are generous enough for a
@@ -77,6 +78,29 @@ The whole protocol is documented in the header of [`rendezvous.py`](rendezvous.p
 WebSocket registration, a line-preamble TCP relay (`RV1 dial|attach|query|punch`), and a
 two-datagram UDP "what do I look like?" exchange. It is deliberately small — one file, one
 event loop, no database.
+
+## findd: where each desktop is, right now
+
+The [`findd/`](findd/) folder is the second program on our server, written in Rust, on UDP port `8753`.
+Desktops send it a short authenticated heartbeat from the same port a phone will use, so it always knows
+each desktop's current public address. When a phone asks for its desktop, the meeting point asks
+findd over a local socket (`RV_FINDD_CTL`), and findd tells the desktop that a phone is coming.
+
+findd keeps everything in memory: a restart forgets every desktop, and each one joins again on its
+own. It holds one secret, its signing key in `/etc/orpheic-findd/`, which proves to Orpheic that it
+is our findd. The meeting point's unit is not allowed to read that folder.
+
+**You don't need findd to run your own meeting point.** A released Orpheic only trusts the key of
+our findd, so a findd you run yourself would not be used, and your own meeting point works without
+one. It is here so you can read exactly what runs on our server.
+
+- `findd/release.sh` is how we build it: the committed lockfile, the pinned Rust version, a refusal
+  of the load-test build, and the sha256 of the result.
+- [`orpheic-findd.service`](orpheic-findd.service) is the unit we run. It reads `FINDD_PUBLIC`, the
+  server's own public addresses, from `/etc/orpheic-findd/env`: a desktop's handshake signed for any other
+  address is refused.
+- The comments refer to sections of our design notes (§12, §13), which are not published. A few
+  log lines are in Greek.
 
 ## Security
 

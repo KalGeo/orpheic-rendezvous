@@ -1,0 +1,19 @@
+[package]
+name = "findd"
+version = "0.1.0"
+edition = "2021"
+description = "Orpheic rendezvous: the heartbeat catalog of docs/design/findability.md §12 + §13"
+license = "MIT"
+publish = false
+
+[dependencies]
+ring = "0.17"
+libc = "0.2"
+
+[features]
+# A load test from ONE machine needs the per-host limits lifted (FINDD_BENCH=1). The production
+# build has no such switch at all (S fix 8).
+bench = []
+
+[profile.release]
+lto = true

@@ -155,6 +155,7 @@ impl Engine {
         let Some(p) = wire::parse(d) else { self.n.malformed += 1; return None };
         let r = match p {
             Packet::Hello => self.on_hello(src, now, out),
+            Packet::HelloN(n) => self.on_hello_n(src, &n, now, out),
             Packet::Hs(h) => self.on_hs(src, h, now, out),
             Packet::Beat(b) => self.on_beat(src, b, now, out),
             Packet::Probe(p) => { self.on_probe(src, p, now); None }
@@ -167,6 +168,13 @@ impl Engine {
         if !self.b_cookie_all.allow(0u8, now) { self.n.reply_drop += 1; return None; }
         self.n.cookies += 1;
         Some(wire::put_cookie(out, &crypto::cookie(&self.ks, &src.ip, src.port, now / 60_000)))
+    }
+
+    /// A10 B1: the same cookie, with the HELLO's nonce echoed after it (wire::HELLO_N_LEN).
+    fn on_hello_n(&mut self, src: Addr, nonce: &[u8; 8], now: u64, out: &mut [u8]) -> Option<usize> {
+        if !self.b_cookie_all.allow(0u8, now) { self.n.reply_drop += 1; return None; }
+        self.n.cookies += 1;
+        Some(wire::put_cookie_n(out, &crypto::cookie(&self.ks, &src.ip, src.port, now / 60_000), nonce))
     }
 
     fn cookie_ok(&self, src: Addr, c: &[u8], now: u64) -> bool {

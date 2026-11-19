@@ -16,6 +16,13 @@ pub const CANARY: u8 = 0x1A;
 
 pub const HELLO_LEN: usize = 20;
 pub const COOKIE_LEN: usize = 17;
+/// A10 B1 (19/11/2026): a HELLO that carries an 8-byte nonce, and the COOKIE that echoes it. A COOKIE is not signed,
+/// so without the echo anyone who can send from findd's address could feed a desktop forged cookies (say every 100 ms)
+/// and keep its handshake failing for good. Same type bytes, other lengths: a findd from before this drops the 28-byte
+/// HELLO (exact lengths only) and never sends the 25-byte COOKIE, so a desktop sends both HELLOs until the server has
+/// echoed once in that session, and an old desktop never meets either. 0x10 | nonce 8 | zero 19 → 0x12 | cookie 16 | nonce 8.
+pub const HELLO_N_LEN: usize = 28;
+pub const COOKIE_N_LEN: usize = 25;
 /// 0x11: … flags(1) | dst addr16+port(18) | sig(64). `dst` = the address the desktop SENT this to, inside the signature:
 /// a DNS-spoofed relay at another address cannot pass the desktop's handshake on to findd (Fable, DNS audit 5/11 #2).
 pub const HS_LEN: usize = 182;
@@ -77,6 +84,7 @@ pub struct Probe<'a> {
 
 pub enum Packet<'a> {
     Hello,
+    HelloN([u8; 8]),   // A10 B1: the nonce to echo
     Hs(Hs<'a>),
     Beat(Beat<'a>),
     Probe(Probe<'a>),
@@ -88,6 +96,7 @@ fn u64_at(d: &[u8], i: usize) -> u64 { u64::from_be_bytes(d[i..i + 8].try_into()
 pub fn parse(d: &[u8]) -> Option<Packet<'_>> {
     match (d.first()?, d.len()) {
         (&HELLO, HELLO_LEN) => Some(Packet::Hello),
+        (&HELLO, HELLO_N_LEN) if d[9..].iter().all(|&b| b == 0) => Some(Packet::HelloN(d[1..9].try_into().unwrap())),
         (&HS, HS_LEN) => Some(Packet::Hs(Hs {
             cookie: &d[1..17],
             pub_: d[17..49].try_into().unwrap(),
@@ -117,6 +126,10 @@ pub fn parse(d: &[u8]) -> Option<Packet<'_>> {
 
 pub fn put_cookie(o: &mut [u8], cookie: &[u8; 16]) -> usize {
     o[0] = COOKIE; o[1..17].copy_from_slice(cookie); COOKIE_LEN
+}
+/// A10 B1: the cookie, followed by the HELLO's nonce.
+pub fn put_cookie_n(o: &mut [u8], cookie: &[u8; 16], nonce: &[u8; 8]) -> usize {
+    o[0] = COOKIE; o[1..17].copy_from_slice(cookie); o[17..25].copy_from_slice(nonce); COOKIE_N_LEN
 }
 /// Writes bytes[0..49] of an HSOK (type, rowid, xpub_s, ctr_echo); the caller adds confirm + sig.
 pub fn put_hsok_head(o: &mut [u8], rowid: u64, xpub_s: &[u8], ctr_echo: u64) {
@@ -150,6 +163,7 @@ mod tests {
     #[test]
     fn replies_never_larger_than_their_trigger() {
         assert!(COOKIE_LEN <= HELLO_LEN);
+        assert!(COOKIE_N_LEN <= HELLO_N_LEN);
         assert!(HSOK_LEN <= HS_LEN);
         assert!(ACK_LEN <= BEAT_LEN);
         assert!(MOVE_LEN <= BEAT_LEN);

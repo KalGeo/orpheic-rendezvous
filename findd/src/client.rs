@@ -28,6 +28,10 @@ impl Desk {
         Desk { kp, pub_, boot, ctr: 0, rowid: 0, keys: None, addr }
     }
     pub fn hello() -> Vec<u8> { let mut v = vec![0u8; wire::HELLO_LEN]; v[0] = wire::HELLO; v }
+    /// A10 B1: a HELLO whose COOKIE answer must echo `nonce` (wire::HELLO_N_LEN).
+    pub fn hello_n(nonce: &[u8; 8]) -> Vec<u8> {
+        let mut v = vec![0u8; wire::HELLO_N_LEN]; v[0] = wire::HELLO; v[1..9].copy_from_slice(nonce); v
+    }
 
     /// Build an HS; returns (packet, ephemeral key, xpub) so the test can finish the exchange.
     pub fn hs(&mut self, cookie: &[u8]) -> (Vec<u8>, agreement::EphemeralPrivateKey, [u8; 32]) {
@@ -74,8 +78,9 @@ impl Desk {
         let mut sm = wire::CTX_HSOK.to_vec(); sm.extend_from_slice(&hsok[..65]); sm.extend_from_slice(&self.pub_); sm.extend_from_slice(&xpub);
         if signature::UnparsedPublicKey::new(&signature::ED25519, &server_pub).verify(&sm, &hsok[65..129]).is_err() { return false; }
         let xs = hsok[9..41].to_vec(); let (pb, bt) = (self.pub_, self.boot);
-        let keys = agreement::agree_ephemeral(eph, &agreement::UnparsedPublicKey::new(&agreement::X25519, &xs),
-            |sh| crypto::derive(sh, &pb, &xpub, &xs, bt)).unwrap();
+        // A10 B3: a key the agreement refuses (all zeros, a small-order point) is a refused answer, not a panic.
+        let Ok(keys) = agreement::agree_ephemeral(eph, &agreement::UnparsedPublicKey::new(&agreement::X25519, &xs),
+            |sh| crypto::derive(sh, &pb, &xpub, &xs, bt)) else { return false };
         let rowid = u64::from_be_bytes(hsok[1..9].try_into().unwrap());
         let conf = crypto::mac16(&keys.conf, &[b"c", &[wire::HSOK], &rowid.to_be_bytes(), &ctr_echo.to_be_bytes()]);
         if !crypto::ct_eq(&conf, &hsok[49..65]) { return false; }

@@ -662,3 +662,44 @@ fn a_pending_probe_is_not_overwritten() {
     assert_eq!(e.n.probes, 1, "one pending probe per row");
     assert_eq!(e.canaries.len(), 1, "nothing piles up in the queue");
 }
+
+// ── A10 B1 (19/11/2026): the HELLO with a nonce, and old and new desktops side by side ──
+#[test]
+fn a10_b1_a_nonce_hello_gets_its_nonce_back_and_the_same_cookie() {
+    let mut e = engine();
+    let d = Desk::new(a(1, 5000), 1 << 32);
+    let old = send(&mut e, d.addr, &Desk::hello(), 1_000).expect("an old desktop's HELLO still gets a cookie");
+    assert_eq!(old.len(), wire::COOKIE_LEN, "and in the old form: an old desktop reads exactly 17 bytes");
+    let nonce = [7u8, 1, 2, 3, 4, 5, 6, 9];
+    let new = send(&mut e, d.addr, &Desk::hello_n(&nonce), 1_000).expect("a new desktop's HELLO gets a cookie");
+    assert_eq!(new.len(), wire::COOKIE_N_LEN);
+    assert_eq!(new[0], wire::COOKIE);
+    assert_eq!(&new[17..25], &nonce, "the nonce comes back");
+    assert_eq!(&new[1..17], &old[1..17], "the cookie itself is the same one");
+}
+
+#[test]
+fn a10_b1_the_echoed_cookie_admits_the_handshake_like_the_old_one() {
+    let mut e = engine();
+    let mut d = Desk::new(a(1, 5000), 1 << 32);
+    let c = send(&mut e, d.addr, &Desk::hello_n(&[1u8; 8]), 2_000).expect("cookie");
+    let (hs, eph, xpub) = d.hs(&c[1..17]);
+    let ok = send(&mut e, d.addr, &hs, 2_000).expect("hsok");
+    assert!(d.accept(&ok, eph, xpub, &server_pub()));
+    // and an old desktop beside it still joins the old way
+    let mut old = Desk::new(a(2, 5000), 1 << 32);
+    assert!(join(&mut e, &mut old, 2_000));
+}
+
+#[test]
+fn a10_b1_other_hello_lengths_stay_unanswered() {
+    let mut e = engine();
+    let mut b = vec![0u8; wire::HELLO_N_LEN + 1];
+    b[0] = wire::HELLO;
+    assert!(send(&mut e, a(1, 5000), &b, 0).is_none());
+    assert!(send(&mut e, a(1, 5000), &b[..wire::HELLO_N_LEN - 1], 0).is_none());
+    // the 19 bytes after the nonce must be zero
+    let mut h = Desk::hello_n(&[5u8; 8]);
+    h[wire::HELLO_N_LEN - 1] = 1;
+    assert!(send(&mut e, a(1, 5000), &h, 0).is_none(), "a nonce HELLO whose padding is not zero is not answered");
+}

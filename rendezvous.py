@@ -24,9 +24,17 @@ who talked to whom, when, for how long. That metadata is unavoidable — it is w
 this on YOUR OWN machine and nobody else's.
 
 Wire:
-  control  (WebSocket, port 8750):
+  control  (WebSocket: public port 8750, and/or a Unix socket behind OUR nginx for wss://<host>/rv —
+            ε#3, server/LEVEL-B-PLAN.md D4-D6):
     S→C  {"t":"challenge","nonce":"<b64 16B>"}
-    C→S  {"t":"register","pub":"<b64 32B>","sig":"<b64 sign('orpheic-rv-v1-register'+nonce)>"}
+    C→S  {"t":"register","v":2,"ep":"<server name>","pub":"<b64 32B>",
+          "sig":"<b64 sign('orpheic-rv-v2-register\\0' + u8 len(ep) + ep + nonce)>"}
+                                                    ← v2: the signature names WHICH server it is for, so
+                                                      another rendezvous cannot pass it on to us. `ep` must
+                                                      be one of RV_SERVER_NAMES, byte for byte.
+    C→S  {"t":"register","pub":…,"sig":"<b64 sign('orpheic-rv-v1-register'+nonce)>"}
+                                                    ← v1, old desktops: ONLY on the public 8750 listener,
+                                                      counted daily so its end date can be set.
     S→C  {"t":"registered"[,"doorsVersion":1,"doors":{"obs":[{host,port,proto}]}]}
                                                     ← the obs door, ONLY when RV_OBS_HOST has
                                                       split it out; the desktop observes against
@@ -49,7 +57,10 @@ Wire:
   RV_RELAY=off makes this server a pure introducer: dial/attach are refused, the "relay"
   flag tells phones so they can say an honest sentence instead of dialling a wall.
   observation (UDP, port 8752), the sideline language of link/src/magic.rs:
-    C→S  "ORPH1 obs?"            S→C  "ORPH1 obs=<ip:port as this server saw it>"
+    C→S  "ORPH1 obs? <nonce>"    S→C  "ORPH1 obs=<ip:port as this server saw it> <nonce>"   (A10 B6: 16 lower-case
+                                                    hex digits, zero-padded to 80 bytes, echoed, so an answer forged
+                                                    from our address with another address in it is not believed)
+    C→S  "ORPH1 obs?"            S→C  "ORPH1 obs=<ip:port as this server saw it>"           (old Links, unchanged)
 
 Every door is rate-limited per source IP (loopback exempt), with global ceilings and idle
 eviction, so a flood exhausts nobody — see the "Abuse defence" block. The server holds no
@@ -62,6 +73,8 @@ Deploy: /opt/orpheic-rendezvous/ + the systemd unit (server/DEPLOY.md).
 import asyncio
 import binascii
 import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -69,6 +82,7 @@ import os
 import re
 import secrets
 import socket
+import stat
 import sys
 import time
 
@@ -80,6 +94,76 @@ CONTROL_PORT = int(os.environ.get("RV_CONTROL_PORT", "8750"))
 RELAY_PORT = int(os.environ.get("RV_RELAY_PORT", "8751"))
 OBS_PORT = int(os.environ.get("RV_OBS_PORT", "8752"))
 SIGN_PREFIX = b"orpheic-rv-v1-register"
+SIGN_PREFIX_V2 = b"orpheic-rv-v2-register\0"
+
+# --- ε#3: wss through our nginx, and a signature that names its server (server/LEVEL-B-PLAN.md D4-D6) --------------
+# The names this server answers to, ALREADY in canonical form (A-label, lower case, no trailing dot; IP literals
+# compressed), comma-separated. The v2 signature's name is compared to them byte for byte: this server never
+# canonicalises what a desktop sends (Python's built-in IDNA is 2003 and Qt's is UTS#46: they differ, on the Greek final
+# sigma among others). Unset: v2 is refused, never guessed from a Host header.
+def _canonical_name(n: str) -> bool:
+    """Is this entry ALREADY in the form a desktop signs? Never fixed up here: a wrong entry is refused and reported, so
+    the operator sees it instead of a server that silently answers to a name no desktop will ever sign."""
+    if not n or not n.isascii() or len(n) > 253 or n != n.lower() or n.endswith(".") or n.startswith("["):
+        return False
+    try:
+        a = ipaddress.ip_address(n)
+    except ValueError:
+        # A name: no port, no IPv6 that failed to parse, and not a numeric spelling the desktop would rewrite
+        # (01.2.3.4 or 1.2.3 are signed as 1.2.3.4 or 1.2.0.3, never as written).
+        return ":" not in n and re.fullmatch(r"[0-9.]+", n) is None
+    if "%" in n or (a.version == 6 and a.ipv4_mapped is not None):
+        return False                 # a zone, or ::ffff:x.x.x.x (the desktop signs the IPv4)
+    return str(a) == n               # IPv4 dotted, IPv6 compressed (RFC 5952): exactly as written
+
+
+def _server_names(raw: str):
+    """(accepted names as bytes, refused entries as written)."""
+    names, bad = set(), []
+    for n in (raw or "").split(","):
+        n = n.strip()
+        if not n:
+            continue
+        if _canonical_name(n):
+            names.add(n.encode("ascii"))
+        else:
+            bad.append(n)
+    return frozenset(names), bad
+
+
+SERVER_NAMES, SERVER_NAMES_BAD = _server_names(os.environ.get("RV_SERVER_NAMES", ""))
+# The public control listener (8750). Closing it later is THIS switch, never RV_BIND, which would also close the relay
+# (8751) and obs (8752) that phones need (D6).
+CONTROL_PUBLIC = os.environ.get("RV_CONTROL_PUBLIC", "on").strip().lower() not in ("off", "0", "false", "no")
+# The Unix socket nginx proxies wss://<host>/rv to (D4). In a directory only this user may write to (systemd's
+# RuntimeDirectory), so nobody can take its place; WHO may connect is decided by the secret below. Empty = none.
+CONTROL_SOCKET = os.environ.get("RV_CONTROL_SOCKET", "").strip()
+# nginx proves it is OUR nginx with this header (two values during a rotation: add the new one here, switch nginx,
+# remove the old). From a root-only EnvironmentFile; never logged, never in git or in a backup. Shorter than 32
+# characters counts as unset, so the socket refuses everyone rather than trust a guessable value.
+def _proxy_secrets(env) -> tuple:
+    return tuple(v.encode() for v in (env.get("RV_PROXY_SECRET", ""), env.get("RV_PROXY_SECRET_NEXT", "")) if len(v) >= 32)
+
+
+PROXY_SECRETS = _proxy_secrets(os.environ)
+# The v1 count (D6): how many DISTINCT old desktops still register the v1 way, per period — the number its end date is
+# set from. Only the count is logged; the set holds a hash prefix per key, in memory, and is emptied every period.
+V1_COUNT_S = int(os.environ.get("RV_V1_COUNT_S", "86400"))
+V1_SEEN_MAX = 100000
+v1_seen: set = set()
+
+
+def v1_tick():
+    """Log the period's count of distinct v1 desktops and start a new period."""
+    n = len(v1_seen)
+    v1_seen.clear()
+    log.info("v1 desktops in the last %d s: %s", V1_COUNT_S, f"{n}+" if n >= V1_SEEN_MAX else n)
+# On the socket listener (S5, R1): a handshake must finish quickly, and only so many NOT-YET-REGISTERED connections may
+# be open at once, so a flood of slow connections (through nginx from the internet, or from a local process) cannot use
+# up the descriptors every door needs, nor the slots of the homes already registered.
+SOCKET_OPEN_TIMEOUT = 5
+SOCKET_MAX_OPEN = int(os.environ.get("RV_SOCKET_MAX_OPEN", "4096"))
+_socket_open = 0
 
 # --- Advertised doors (Level B: decision 1) -----------------------------------------------
 # ONE thing is advertised and movable: the obs (UDP) door. query/punch stay with the control
@@ -130,9 +214,9 @@ log = logging.getLogger("rendezvous")
 # take is its AVAILABILITY. These caps stop any single source from exhausting it, while
 # staying generous enough for a whole home — or a shared CGNAT address — behind one IP.
 # Everything keys off the SOCKET PEER, the true remote address on all three transports today
-# (the control WS is direct, not yet behind nginx; when it moves to wss://…/rv per §5.7 it
-# keys off CF-Connecting-IP instead, and obs/relay stay socket-peer, always direct).
-# LOOPBACK is exempt: the operator's own testing, and later the trusted local proxy.
+# (the public control WS on 8750 is direct). Behind nginx (wss://<host>/rv, the socket listener) the control WS keys
+# off X-Real-IP, taken ONLY with our nginx's secret (proxied_ip, D4); obs/relay stay socket-peer, always direct.
+# LOOPBACK is exempt only when RV_LIMIT_LOCAL is off: the operator's own testing (production has it on).
 MAX_DESKTOPS     = int(os.environ.get("RV_MAX_DESKTOPS", "5000"))    # global registry ceiling
 MAX_CONN_PER_IP  = int(os.environ.get("RV_MAX_CONN_PER_IP", "32"))   # live control WS per IP
 MAX_DIALS_PER_IP = int(os.environ.get("RV_MAX_DIALS_PER_IP", "8"))   # parked dials per IP
@@ -276,9 +360,10 @@ def _same_nat(peer_ip, desk_ws) -> bool:
     """Is this querier behind the SAME public IP as the desktop (≈ on its home network)? Only
     then are the desktop's LAN candidates useful — and only then is it not internal-topology
     disclosure to hand them out. Fail-closed: any unknown → treat as a stranger."""
-    if peer_ip is None or desk_ws is None or not desk_ws.remote_address:
+    if peer_ip is None or desk_ws is None:
         return False
-    return peer_ip == ip_of(desk_ws.remote_address)
+    d = desk_ip(desk_ws)     # the REAL address the desktop registered from (X-Real-IP behind nginx), not the socket peer
+    return bool(d) and peer_ip == d
 
 
 def _lan_filtered(cands, peer_ip, desk_ws):
@@ -311,25 +396,131 @@ pending: dict[str, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
 circuits = 0
 
 
-async def control(ws):
+_loud_at: dict = {}
+
+
+def _loud(msg: str):
+    """A warning that must be seen but must not flood the journal: at most once a minute per message."""
+    now = time.monotonic()
+    if now - _loud_at.get(msg, -1e9) >= 60:
+        _loud_at[msg] = now
+        log.warning(msg)
+
+
+def _header_values(ws, name: str) -> list:
+    """Every value of one request header, on both websockets APIs (legacy `request_headers`, new `request.headers`)."""
+    req = getattr(ws, "request", None)
+    h = getattr(req, "headers", None) if req is not None else None
+    if h is None:
+        h = getattr(ws, "request_headers", None)
+    if h is None:
+        return []
+    try:
+        return list(h.get_all(name))
+    except AttributeError:
+        v = h.get(name)
+        return [v] if v is not None else []
+
+
+def proxied_ip(ws):
+    """The real client IP of a connection on the socket listener, or None = refuse (D4). Only with OUR nginx's secret
+    (constant-time compare, no early exit), and only ONE X-Real-IP that is ONE valid address. A missing or wrong secret
+    is never a quiet fallback to the socket peer: that would put every wss desktop behind one shared address."""
+    got = _header_values(ws, "X-Orpheic-Proxy")
+    ok = False
+    if len(got) == 1 and PROXY_SECRETS:
+        g = got[0].encode("utf-8", "replace")
+        for sec in PROXY_SECRETS:
+            ok = hmac.compare_digest(g, sec) or ok
+    if not ok:
+        _loud("proxy secret missing or wrong — check the nginx include")
+        return None
+    vals = _header_values(ws, "X-Real-IP")
+    try:
+        if len(vals) != 1 or "%" in vals[0]:
+            raise ValueError
+        a = ipaddress.ip_address(vals[0].strip())
+    except ValueError:
+        _loud("X-Real-IP missing, repeated or not one address — check the nginx block")
+        return None
+    if a.version == 6 and a.ipv4_mapped is not None:
+        a = a.ipv4_mapped
+    return norm_ip(str(a))
+
+
+# ws -> the address every consumer must see: the socket peer on 8750, nginx's X-Real-IP on the socket listener.
+real_ip: dict = {}
+
+
+def desk_ip(ws) -> str:
+    return real_ip.get(ws) or (ip_of(ws.remote_address) if ws is not None else "")
+
+
+async def control_public(ws):
+    """The public 8750 listener: the socket peer is the client. v1 (old desktops); v2 only when this server has NO TLS
+    front (a self-hosted server without TLS). With a socket listener, a v2 desktop belongs on wss: one typed ws://…:8750
+    must not quietly sign our name over plaintext (S3)."""
+    await control(ws, ip_of(ws.remote_address), v1_ok=True, via="8750", v2_ok=not CONTROL_SOCKET)
+
+
+async def control_proxied(ws):
+    """The Unix-socket listener behind nginx: every client here is new, so v2 ONLY (D6)."""
+    ip = proxied_ip(ws)
+    if ip is None:
+        await ws.close(1008)
+        return
+    if not SERVER_NAMES:
+        # v2 only here, and v2 needs our names: refuse BEFORE the challenge, so check-rv-cert.sh's probe sees it.
+        _loud("control socket: RV_SERVER_NAMES is not set — every registration would be refused")
+        await ws.close(1011)
+        return
+    await control(ws, ip, v1_ok=False, via="socket")
+
+
+async def _drop(ws):
+    """Refuse at once, without the closing handshake: a graceful close holds the socket (and, on the socket listener, a
+    slot) for up to ~10 s, which is exactly what a flood wants (R1). After the abort, WAIT for the connection to be
+    closed: the legacy handler calls close() when we return, and on a line that is not yet seen as closed that close()
+    fails and logs "closing handshake failed" with a traceback, one per refusal (third look, #1)."""
+    t = getattr(ws, "transport", None)
+    if t is not None:
+        t.abort()
+        try:
+            await ws.wait_closed()
+        except Exception:
+            pass
+    else:
+        await ws.close()
+
+
+def _release_slot(ws):
+    """A registered desktop no longer counts against the socket listener's ceiling (R1): the ceiling bounds the
+    connections NOT yet proven, never the homes already registered."""
+    rel = getattr(ws, "release_slot", None)
+    if rel is not None:
+        rel()
+
+
+async def control(ws, ip, v1_ok=True, via="8750", v2_ok=True):
     """Guard the connection with the per-IP caps, then serve it."""
     global _live_conns
-    ip = ip_of(ws.remote_address)
     rk = rate_key(ip)   # v6 collapsed to /64 so a single host's address-churn can't slip the caps
     # Global accept ceiling FIRST: the /64 fix bounds one source, this bounds the fleet so a
     # botnet of many IPs (or a soft LimitNOFILE) can't fd-starve every other user's remote.
     if not is_local(ip) and _live_conns >= MAX_LIVE:
-        await ws.close()
+        await _drop(ws)
         return
     if not is_local(ip) and (not conn_rate.allow(rk)
                              or conns_per_ip.get(rk, 0) >= MAX_CONN_PER_IP):
-        await ws.close()
+        await _drop(ws)
         return
     conns_per_ip[rk] = conns_per_ip.get(rk, 0) + 1
     _live_conns += 1
+    real_ip[ws] = ip
     try:
-        await _control(ws, ip)
+        await _control(ws, ip, v1_ok, via, v2_ok)
     finally:
+        real_ip.pop(ws, None)
         _live_conns -= 1
         left = conns_per_ip.get(rk, 0) - 1
         if left > 0:
@@ -338,7 +529,35 @@ async def control(ws):
             conns_per_ip.pop(rk, None)
 
 
-async def _control(ws, ip):
+async def confirm_public(ip, ports, key):
+    """The PUBLIC door, verified rather than believed: whether it was UPnP-mapped or the user forwarded a port by hand,
+    the only address worth handing out is one THIS server just knocked on and found open. A mapping a router accepted
+    and then drops would otherwise cost every phone a timeout."""
+    # ΠΟΤΕ μη «χτυπάς» loopback/RFC1918: με RV_LIMIT_LOCAL=1 το is_local() είναι νεκρό εδώ
+    # (γι' αυτό ο άμεσος έλεγχος)· κόβει το να γίνει ο server σαρωτής εσωτερικών υπηρεσιών
+    # (server-side audit 4/9). Το residual (public-IP port-scan CGNAT-γειτόνων) το φράζει το reg_rate.
+    try:
+        _a = ipaddress.ip_address(ip)
+        if _a.is_loopback or _a.is_private or _a.is_link_local:
+            return
+    except ValueError:
+        return
+    for port in ports:
+        if not (isinstance(port, int) and 1024 <= port < 65536):   # καμία προνομιακή θύρα
+            continue
+        try:
+            _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=3)
+            w.close()
+        except Exception:
+            continue
+        c = candidates.get(key)
+        if c is not None:
+            c.insert(0, f"{ip}:{port}")
+            log.info("public door confirmed %s:%d for %s…", ip, port, key[:12])
+        return
+
+
+async def _control(ws, ip, v1_ok=True, via="8750", v2_ok=True):
     """One desktop's control connection: challenge, verify, then hold the line."""
     nonce = secrets.token_bytes(16)
     await ws.send(json.dumps({"t": "challenge", "nonce": base64.b64encode(nonce).decode()}))
@@ -346,31 +565,53 @@ async def _control(ws, ip):
         raw = await asyncio.wait_for(ws.recv(), timeout=CHALLENGE_S)
         m = json.loads(raw)
         if not isinstance(m, dict):        # [] / 7 / "x": m.get θα έριχνε AttributeError, όχι στο except (Fable)
-            await ws.close()
+            await _drop(ws)
             return
         pub = base64.b64decode(m.get("pub", ""))
         sig = base64.b64decode(m.get("sig", ""))
         if m.get("t") != "register" or len(pub) != 32:
-            await ws.close()
+            await _drop(ws)
             return
-        VerifyKey(pub).verify(SIGN_PREFIX + nonce, sig)   # raises when it does not hold
+        ver = m.get("v")
+        if ver is None and v1_ok:
+            VerifyKey(pub).verify(SIGN_PREFIX + nonce, sig)   # raises when it does not hold
+            is_v1 = True
+        elif type(ver) is int and ver == 2 and v2_ok:
+            # D5: the name the desktop dialled, framed, then the nonce. Compared to OUR names byte for byte.
+            ep = m.get("ep")
+            epb = ep.encode("utf-8") if isinstance(ep, str) else b""
+            if epb not in SERVER_NAMES:
+                if not SERVER_NAMES:
+                    _loud("a v2 registration refused: RV_SERVER_NAMES is not set")
+                await _drop(ws)
+                return
+            VerifyKey(pub).verify(SIGN_PREFIX_V2 + bytes([len(epb)]) + epb + nonce, sig)
+            is_v1 = False
+        else:
+            await _drop(ws)    # v1 where only v2 belongs (the socket listener), or an unknown version
+            return
         # ΚΑΝΟΝΙΚΟ κλειδί: το raw base64 του πελάτη είναι εύπλαστο (padding/τελευταία bytes) — ένα
         # ζεύγος κλειδιών θα έπιανε πολλές θέσεις στο μητρώο. Κλειδί = re-encode των 32 bytes (Fable).
         pub_b64 = base64.b64encode(pub).decode()
     except (asyncio.TimeoutError, BadSignatureError, ValueError, TypeError, KeyError,
             json.JSONDecodeError, websockets.ConnectionClosed):
-        await ws.close()
+        # No answer, a bad signature, junk: refused at once. A graceful close here held an unregistered slot for
+        # CHALLENGE_S + close_timeout, ~18 s (third look, #2).
+        await _drop(ws)
         return
 
     # Past the signature — a genuine registration attempt. Bound how fast one source may make
     # them, and cap the registry globally, so no flood of free keys can exhaust memory.
     if not is_local(ip) and not reg_rate.allow(rate_key(ip)):
-        await ws.close()
+        await _drop(ws)
         return
     if pub_b64 not in desktops and len(desktops) >= MAX_DESKTOPS:
         log.info("registry full (%d) — refusing a new key", len(desktops))
-        await ws.close()
+        await _drop(ws)
         return
+    if is_v1 and len(v1_seen) < V1_SEEN_MAX:
+        v1_seen.add(hashlib.sha256(pub).digest()[:8])
+    _release_slot(ws)
 
     old = desktops.get(pub_b64)
     desktops[pub_b64] = ws
@@ -395,40 +636,12 @@ async def _control(ws, ip):
                 if isinstance(lan, str) and 0 < len(lan) < 64:
                     cands.append(lan)
         candidates[pub_b64] = cands
-        log.info("registered %s… from %s cands=%d", pub_b64[:12], ws.remote_address, len(cands))
+        log.info("registered %s… from %s cands=%d %s via %s", pub_b64[:12], ip, len(cands), "v1" if is_v1 else "v2", via)
 
-        # The PUBLIC door, verified rather than believed: whether it was UPnP-mapped or the user
-        # forwarded a port by hand, the only address worth handing out is one THIS server just
-        # knocked on and found open. A mapping a router accepted and then drops would otherwise
-        # cost every phone a timeout.
-        async def confirm_public(ip, ports, key):
-            # ΠΟΤΕ μη «χτυπάς» loopback/RFC1918: με RV_LIMIT_LOCAL=1 το is_local() είναι νεκρό εδώ
-            # (γι' αυτό ο άμεσος έλεγχος)· κόβει το να γίνει ο server σαρωτής εσωτερικών υπηρεσιών
-            # (server-side audit 4/9). Το residual (public-IP port-scan CGNAT-γειτόνων) το φράζει το reg_rate.
-            try:
-                _a = ipaddress.ip_address(ip)
-                if _a.is_loopback or _a.is_private or _a.is_link_local:
-                    return
-            except ValueError:
-                return
-            for port in ports:
-                if not (isinstance(port, int) and 1024 <= port < 65536):   # καμία προνομιακή θύρα
-                    continue
-                try:
-                    _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=3)
-                    w.close()
-                except Exception:
-                    continue
-                c = candidates.get(key)
-                if c is not None:
-                    c.insert(0, f"{ip}:{port}")
-                    log.info("public door confirmed %s:%d for %s…", ip, port, key[:12])
-                return
-        if ws.remote_address:
-            asyncio.create_task(confirm_public(
-                norm_ip(ws.remote_address[0]),
-                [m.get("mapped", 0), m.get("port", 0)],
-                pub_b64))
+        # The PUBLIC door, verified rather than believed (confirm_public, above). With the REAL client address: through
+        # nginx the socket peer is this machine, and the knock would go nowhere (D4).
+        if ip:
+            asyncio.create_task(confirm_public(ip, [m.get("mapped", 0), m.get("port", 0)], pub_b64))
         # register-ack carries the obs door ONLY when obs has been explicitly split out; the
         # desktop then observes against it (a validated public IP) and forwards it to the phone
         # in `welcome`. Unset ⇒ no keys, and the desktop keeps the controlPort+2 convention.
@@ -777,7 +990,14 @@ class ObsEar(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if data != b"ORPH1 obs?":
+        # A10 B6: the old ask exactly, or the ask with a nonce to echo: 16 lower-case hex digits, then zeros to 80 bytes,
+        # so the answer (at most 74 bytes, an IPv6 address with its port and the nonce) is never larger than the ask.
+        if data == b"ORPH1 obs?":
+            echo = b""
+        elif (len(data) == 80 and data.startswith(b"ORPH1 obs? ") and re.fullmatch(rb"[0-9a-f]{16}", data[11:27])
+              and not data[27:].strip(b"\0")):
+            echo = b" " + data[11:27]
+        else:
             return
         ip = norm_ip(addr[0])
         # A rate-limited ear answers nobody, silently. The per-source bucket stops one asker
@@ -789,7 +1009,7 @@ class ObsEar(asyncio.DatagramProtocol):
         if not is_local(ip) and (not obs_rate.allow(rate_key(ip)) or not obs_global.allow("*")):
             return
         host = f"[{ip}]" if ":" in ip else ip
-        self.transport.sendto(f"ORPH1 obs={host}:{addr[1]}".encode(), addr)
+        self.transport.sendto(f"ORPH1 obs={host}:{addr[1]}".encode() + echo, addr)
 
 
 def _listen_sock(port, dgram=False):
@@ -825,6 +1045,13 @@ async def main():
                 rl.sweep()
     asyncio.create_task(sweeper())
 
+    async def v1_counter():
+        # D6: how many distinct desktops still register the old way. The COUNT only — no key, no address.
+        while True:
+            await asyncio.sleep(V1_COUNT_S)
+            v1_tick()
+    asyncio.create_task(v1_counter())
+
     relay_srv = await asyncio.start_server(relay, sock=_listen_sock(RELAY_PORT))
     await asyncio.get_running_loop().create_datagram_endpoint(
         ObsEar, sock=_listen_sock(OBS_PORT, dgram=True))
@@ -834,12 +1061,104 @@ async def main():
     # max_size caps every control frame at 4 KiB: register (pub/sig) and the periodic udp updates
     # are tens of bytes, so the 1 MiB websockets default was a free json.loads/b64decode amplifier
     # for a registered peer. Well above any real message, well below anything worth parsing.
-    async with websockets.serve(control, sock=_listen_sock(CONTROL_PORT), ping_interval=240,
-                                ping_timeout=60, max_size=4096):
-        log.info("bind %s · control :%d · relay :%d (%s) · obs :%d/udp", BIND, CONTROL_PORT,
-                 RELAY_PORT, "on" if RELAY_ON else "OFF — introductions only", OBS_PORT)
-        async with relay_srv:
-            await relay_srv.serve_forever()
+    ws_opts = dict(ping_interval=240, ping_timeout=60, max_size=4096)
+    control_srvs = []
+    if CONTROL_PUBLIC:
+        control_srvs.append(await websockets.serve(control_public, sock=_listen_sock(CONTROL_PORT), **ws_opts))
+    if CONTROL_SOCKET:
+        # S1: the socket is the NEW door; its failure must never take the old ones (8750/8751/8752) down with it, or
+        # one wrong path would crash-loop the whole meeting point. Said loudly, and the rest serves.
+        # ANY exception: on 18/11 a keyword the installed websockets did not know raised TypeError, and a narrower
+        # catch let it take the whole server down.
+        try:
+            control_srvs.append(await serve_control_socket(CONTROL_SOCKET, ws_opts))
+        except (Exception, SystemExit) as ex:
+            log.error("control socket %s NOT serving (%s: %s) — wss desktops cannot register; 8750/8751/8752 go on",
+                      CONTROL_SOCKET, type(ex).__name__, scrub(str(ex)))
+        if not PROXY_SECRETS:
+            log.warning("control socket %s refuses EVERY connection: no RV_PROXY_SECRET of 32+ characters", CONTROL_SOCKET)
+        if not SERVER_NAMES:
+            log.warning("control socket %s accepts only v2, and RV_SERVER_NAMES is not set: every registration refused",
+                        CONTROL_SOCKET)
+    if SERVER_NAMES_BAD:
+        log.warning("RV_SERVER_NAMES entries ignored (not canonical: lower-case A-label, no trailing dot): %s",
+                    scrub(",".join(SERVER_NAMES_BAD)))
+    log.info("bind %s · control :%d %s · socket %s · relay :%d (%s) · obs :%d/udp · v2 names %d · proxy secrets %d",
+             BIND, CONTROL_PORT, "public" if CONTROL_PUBLIC else "CLOSED (RV_CONTROL_PUBLIC=off)",
+             CONTROL_SOCKET or "(none)", RELAY_PORT, "on" if RELAY_ON else "OFF — introductions only", OBS_PORT,
+             len(SERVER_NAMES), len(PROXY_SECRETS))
+    async with relay_srv:
+        await relay_srv.serve_forever()
+
+
+def _capped_protocol() -> dict:
+    """S5/R1: a ceiling on the socket listener's connections that are NOT YET REGISTERED, counted from the accept (before
+    any header, so before the secret) until the registration succeeds or the line closes; a registered desktop gives its
+    slot back, so the ceiling can never be filled by the homes it protects. Over the ceiling, and a handshake not done
+    within SOCKET_OPEN_TIMEOUT: abort(), no closing handshake. On the websockets API this server runs (legacy, Ubuntu
+    24.04's 10.x, which has no open_timeout) through its protocol class. On websockets 14+ there is no such hook here:
+    no ceiling, only the library's own handshake timeout, and that is said once at start (R8)."""
+    base = None
+    try:
+        from websockets.legacy.server import WebSocketServerProtocol as base   # noqa: N813
+    except ImportError:
+        pass
+    if base is None or not getattr(websockets.unix_serve, "__module__", "").startswith("websockets.legacy"):
+        log.warning("control socket: no connection ceiling on this websockets version (%s)",
+                    getattr(websockets, "__version__", "?"))
+        return {}
+
+    class Capped(base):
+        counted = False
+
+        def release_slot(self):
+            global _socket_open
+            if self.counted:
+                self.counted = False
+                _socket_open -= 1
+
+        def connection_made(self, transport):
+            global _socket_open
+            super().connection_made(transport)
+            if _socket_open >= SOCKET_MAX_OPEN:
+                _loud("control socket: too many unregistered connections open at once — refusing new ones")
+                transport.abort()
+                return
+            _socket_open += 1
+            self.counted = True
+
+            def slow():   # still no finished handshake: a slow-loris, not nginx
+                if getattr(getattr(self, "state", None), "name", "") == "CONNECTING":
+                    _loud("control socket: a handshake took too long — dropped")
+                    transport.abort()
+            asyncio.get_running_loop().call_later(SOCKET_OPEN_TIMEOUT, slow)
+
+        def connection_lost(self, exc):
+            self.release_slot()
+            super().connection_lost(exc)
+
+    return {"create_protocol": Capped}
+
+
+async def serve_control_socket(path, ws_opts):
+    """The listener nginx proxies wss://<host>/rv to (D4). A stale socket from a killed run is removed first; anything
+    else at that path is left alone and THIS listener does not start (main() says so loudly and serves the rest, S1).
+    Born 0660: never wider, not even for an instant."""
+    try:
+        if stat.S_ISSOCK(os.lstat(path).st_mode):
+            os.unlink(path)
+        else:
+            raise OSError(f"{path} exists and is not a socket: not touching it")
+    except FileNotFoundError:
+        pass
+    old = os.umask(0o117)
+    try:
+        # close_timeout 2 s: the only graceful closes left here are the 1008/1011 the probe reads (third look, #2).
+        srv = await websockets.unix_serve(control_proxied, path, **_capped_protocol(), **{**ws_opts, "close_timeout": 2})
+    finally:
+        os.umask(old)
+    os.chmod(path, 0o660)
+    return srv
 
 
 if __name__ == "__main__":
